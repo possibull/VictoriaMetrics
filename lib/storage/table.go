@@ -68,6 +68,16 @@ func (ptw *partitionWrapper) decRef() {
 	ptw.pt = nil
 }
 
+func (ptw *partitionWrapper) waitForSoleOwnership() {
+	for {
+		n := ptw.refCount.Load()
+		if n == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (ptw *partitionWrapper) scheduleToDrop() {
 	ptw.mustDrop.Store(true)
 }
@@ -175,8 +185,10 @@ func (tb *table) MustClose() {
 	tb.ptwsLock.Unlock()
 
 	for _, ptw := range ptws {
+		// Wait for references to the partition to be released by searches and merges.
+		ptw.waitForSoleOwnership()
 		if n := ptw.refCount.Load(); n != 1 {
-			logger.Panicf("BUG: unexpected refCount=%d when closing the partition; probably there are pending searches", n)
+			logger.Panicf("BUG: unexpected refCount=%d when closing the partition; probably there are pending searches or merges", n)
 		}
 		ptw.decRef()
 	}
