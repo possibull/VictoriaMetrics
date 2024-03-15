@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -127,11 +128,12 @@ type partition struct {
 	// Contains file-based parts with big number of items, which are visible for search.
 	bigParts []*partWrapper
 
-	// stopCh is used for notifying all the background workers to stop.
+	// ctx is used for notifying all the background workers to stop.
 	//
-	// It must be closed under partsLock in order to prevent from calling wg.Add()
-	// after stopCh is closed.
-	stopCh chan struct{}
+	// It must be cancelled under partsLock in order to prevent from calling wg.Add()
+	// after ctx is cancelled.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// wg is used for waiting for all the background workers to stop.
 	//
@@ -194,7 +196,7 @@ func (pw *partWrapper) decRef() {
 
 // mustCreatePartition creates new partition for the given timestamp and the given paths
 // to small and big partitions.
-func mustCreatePartition(timestamp int64, smallPartitionsPath, bigPartitionsPath string, s *Storage) *partition {
+func mustCreatePartition(ctx context.Context, timestamp int64, smallPartitionsPath, bigPartitionsPath string, s *Storage) *partition {
 	name := timestampToPartitionName(timestamp)
 	smallPartsPath := filepath.Join(filepath.Clean(smallPartitionsPath), name)
 	bigPartsPath := filepath.Join(filepath.Clean(bigPartitionsPath), name)
@@ -204,6 +206,10 @@ func mustCreatePartition(timestamp int64, smallPartitionsPath, bigPartitionsPath
 	fs.MustMkdirFailIfExist(bigPartsPath)
 
 	pt := newPartition(name, smallPartsPath, bigPartsPath, s)
+	ctxLocal, cancel := context.WithCancel(ctx)
+	pt.ctx = ctxLocal
+	pt.cancel = cancel
+
 	pt.tr.fromPartitionTimestamp(timestamp)
 	pt.startBackgroundWorkers()
 
@@ -235,7 +241,7 @@ func (pt *partition) Drop() {
 }
 
 // mustOpenPartition opens the existing partition from the given paths.
-func mustOpenPartition(smallPartsPath, bigPartsPath string, s *Storage) *partition {
+func mustOpenPartition(ctx context.Context, smallPartsPath, bigPartsPath string, s *Storage) *partition {
 	smallPartsPath = filepath.Clean(smallPartsPath)
 	bigPartsPath = filepath.Clean(bigPartsPath)
 
@@ -260,6 +266,9 @@ func mustOpenPartition(smallPartsPath, bigPartsPath string, s *Storage) *partiti
 	pt := newPartition(name, smallPartsPath, bigPartsPath, s)
 	pt.smallParts = smallParts
 	pt.bigParts = bigParts
+	ctxLocal, cancel := context.WithCancel(ctx)
+	pt.ctx = ctxLocal
+	pt.cancel = cancel
 	if err := pt.tr.fromPartitionName(name); err != nil {
 		logger.Panicf("FATAL: cannot obtain partition time range from smallPartsPath %q: %s", smallPartsPath, err)
 	}
@@ -274,7 +283,6 @@ func newPartition(name, smallPartsPath, bigPartsPath string, s *Storage) *partit
 		smallPartsPath: smallPartsPath,
 		bigPartsPath:   bigPartsPath,
 		s:              s,
-		stopCh:         make(chan struct{}),
 	}
 	p.mergeIdx.Store(uint64(time.Now().UnixNano()))
 	p.rawRows.init()
@@ -616,7 +624,7 @@ func (pt *partition) inmemoryPartsMerger() {
 		}
 
 		inmemoryPartsConcurrencyCh <- struct{}{}
-		err := pt.mergeParts(pws, pt.stopCh, false)
+		err := pt.mergeParts(pws, pt.ctx.Done(), false)
 		<-inmemoryPartsConcurrencyCh
 
 		if err == nil {
@@ -649,7 +657,7 @@ func (pt *partition) smallPartsMerger() {
 		}
 
 		smallPartsConcurrencyCh <- struct{}{}
-		err := pt.mergeParts(pws, pt.stopCh, false)
+		err := pt.mergeParts(pws, pt.ctx.Done(), false)
 		<-smallPartsConcurrencyCh
 
 		if err == nil {
@@ -682,7 +690,7 @@ func (pt *partition) bigPartsMerger() {
 		}
 
 		bigPartsConcurrencyCh <- struct{}{}
-		err := pt.mergeParts(pws, pt.stopCh, false)
+		err := pt.mergeParts(pws, pt.ctx.Done(), false)
 		<-bigPartsConcurrencyCh
 
 		if err == nil {
@@ -870,7 +878,7 @@ func (pt *partition) MustClose() {
 	// The pt.partsLock is aquired in order to guarantee that pt.wg.Add() isn't called
 	// after pt.stopCh is closed and pt.wg.Wait() is called below.
 	pt.partsLock.Lock()
-	close(pt.stopCh)
+	pt.cancel()
 	pt.partsLock.Unlock()
 
 	// Wait for background workers to stop.
@@ -918,7 +926,7 @@ func (pt *partition) startInmemoryPartsMergers() {
 
 func (pt *partition) startInmemoryPartsMergerLocked() {
 	select {
-	case <-pt.stopCh:
+	case <-pt.ctx.Done():
 		return
 	default:
 	}
@@ -939,7 +947,7 @@ func (pt *partition) startSmallPartsMergers() {
 
 func (pt *partition) startSmallPartsMergerLocked() {
 	select {
-	case <-pt.stopCh:
+	case <-pt.ctx.Done():
 		return
 	default:
 	}
@@ -960,7 +968,7 @@ func (pt *partition) startBigPartsMergers() {
 
 func (pt *partition) startBigPartsMergerLocked() {
 	select {
-	case <-pt.stopCh:
+	case <-pt.ctx.Done():
 		return
 	default:
 	}
@@ -1036,7 +1044,7 @@ func (pt *partition) inmemoryPartsFlusher() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-pt.stopCh:
+		case <-pt.ctx.Done():
 			return
 		case <-ticker.C:
 			pt.flushInmemoryPartsToFiles(false)
@@ -1051,7 +1059,7 @@ func (pt *partition) pendingRowsFlusher() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-pt.stopCh:
+		case <-pt.ctx.Done():
 			return
 		case <-ticker.C:
 			pt.flushPendingRows(false)
@@ -1202,7 +1210,7 @@ func (pt *partition) ForceMergeAllParts() error {
 	// If len(pws) == 1, then the merge must run anyway.
 	// This allows applying the configured retention, removing the deleted series
 	// and performing de-duplication if needed.
-	if err := pt.mergePartsToFiles(pws, pt.stopCh, bigPartsConcurrencyCh); err != nil {
+	if err := pt.mergePartsToFiles(pws, pt.ctx.Done(), bigPartsConcurrencyCh); err != nil {
 		return fmt.Errorf("cannot force merge %d parts from partition %q: %w", len(pws), pt.name, err)
 	}
 
@@ -1693,7 +1701,7 @@ func (pt *partition) stalePartsRemover() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-pt.stopCh:
+		case <-pt.ctx.Done():
 			return
 		case <-ticker.C:
 			pt.removeStaleParts()

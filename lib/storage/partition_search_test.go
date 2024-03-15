@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -169,7 +170,7 @@ func testPartitionSearchEx(t *testing.T, ptt int64, tr TimeRange, partsCount, ma
 	// Create partition from rowss and test search on it.
 	strg := newTestStorage()
 	strg.retentionMsecs = timestampFromTime(time.Now()) - ptr.MinTimestamp + 3600*1000
-	pt := mustCreatePartition(ptt, "small-table", "big-table", strg)
+	pt := mustCreatePartition(context.Background(), ptt, "small-table", "big-table", strg)
 	smallPartsPath := pt.smallPartsPath
 	bigPartsPath := pt.bigPartsPath
 	for _, rows := range rowss {
@@ -182,7 +183,7 @@ func testPartitionSearchEx(t *testing.T, ptt int64, tr TimeRange, partsCount, ma
 	pt.MustClose()
 
 	// Open the created partition and test search on it.
-	pt = mustOpenPartition(smallPartsPath, bigPartsPath, strg)
+	pt = mustOpenPartition(context.Background(), smallPartsPath, bigPartsPath, strg)
 	testPartitionSearch(t, pt, tsids, tr, rbsExpected, rowsCountExpected)
 	pt.MustClose()
 	stopTestStorage(strg)

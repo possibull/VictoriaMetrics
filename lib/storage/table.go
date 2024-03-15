@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -25,7 +26,8 @@ type table struct {
 	ptws     []*partitionWrapper
 	ptwsLock sync.Mutex
 
-	stop chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	retentionWatcherWG  sync.WaitGroup
 	finalDedupWatcherWG sync.WaitGroup
@@ -109,7 +111,8 @@ func mustOpenTable(path string, s *Storage) *table {
 	fs.MustRemoveTemporaryDirs(bigSnapshotsPath)
 
 	// Open partitions.
-	pts := mustOpenPartitions(smallPartitionsPath, bigPartitionsPath, s)
+	ctx, cancel := context.WithCancel(context.Background())
+	pts := mustOpenPartitions(ctx, smallPartitionsPath, bigPartitionsPath, s)
 
 	tb := &table{
 		path:                path,
@@ -117,7 +120,8 @@ func mustOpenTable(path string, s *Storage) *table {
 		bigPartitionsPath:   bigPartitionsPath,
 		s:                   s,
 
-		stop: make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	for _, pt := range pts {
 		tb.addPartitionNolock(pt)
@@ -175,7 +179,7 @@ func (tb *table) addPartitionNolock(pt *partition) {
 // MustClose closes the table.
 // It is expected that all the pending searches on the table are finished before calling MustClose.
 func (tb *table) MustClose() {
-	close(tb.stop)
+	tb.cancel()
 	tb.retentionWatcherWG.Wait()
 	tb.finalDedupWatcherWG.Wait()
 
@@ -363,7 +367,7 @@ func (tb *table) MustAddRows(rows []rawRow) {
 			continue
 		}
 
-		pt := mustCreatePartition(r.Timestamp, tb.smallPartitionsPath, tb.bigPartitionsPath, tb.s)
+		pt := mustCreatePartition(tb.ctx, r.Timestamp, tb.smallPartitionsPath, tb.bigPartitionsPath, tb.s)
 		pt.AddRows(missingRows[i : i+1])
 		tb.addPartitionNolock(pt)
 	}
@@ -398,7 +402,7 @@ func (tb *table) retentionWatcher() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-tb.stop:
+		case <-tb.ctx.Done():
 			return
 		case <-ticker.C:
 		}
@@ -466,7 +470,7 @@ func (tb *table) finalDedupWatcher() {
 	defer t.Stop()
 	for {
 		select {
-		case <-tb.stop:
+		case <-tb.ctx.Done():
 			return
 		case <-t.C:
 			f()
@@ -496,7 +500,7 @@ func (tb *table) PutPartitions(ptws []*partitionWrapper) {
 	}
 }
 
-func mustOpenPartitions(smallPartitionsPath, bigPartitionsPath string, s *Storage) []*partition {
+func mustOpenPartitions(ctx context.Context, smallPartitionsPath, bigPartitionsPath string, s *Storage) []*partition {
 	// Certain partition directories in either `big` or `small` dir may be missing
 	// after restoring from backup. So populate partition names from both dirs.
 	ptNames := make(map[string]bool)
@@ -506,7 +510,7 @@ func mustOpenPartitions(smallPartitionsPath, bigPartitionsPath string, s *Storag
 	for ptName := range ptNames {
 		smallPartsPath := filepath.Join(smallPartitionsPath, ptName)
 		bigPartsPath := filepath.Join(bigPartitionsPath, ptName)
-		pt := mustOpenPartition(smallPartsPath, bigPartsPath, s)
+		pt := mustOpenPartition(ctx, smallPartsPath, bigPartsPath, s)
 		pts = append(pts, pt)
 	}
 	return pts
