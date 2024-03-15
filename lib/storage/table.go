@@ -31,6 +31,7 @@ type table struct {
 
 	retentionWatcherWG  sync.WaitGroup
 	finalDedupWatcherWG sync.WaitGroup
+	forceMergesRunning  atomic.Int64
 }
 
 // partitionWrapper provides refcounting mechanism for the partition.
@@ -68,16 +69,6 @@ func (ptw *partitionWrapper) decRef() {
 	// Drop the partition.
 	ptw.pt.Drop()
 	ptw.pt = nil
-}
-
-func (ptw *partitionWrapper) waitForSoleOwnership() {
-	for {
-		n := ptw.refCount.Load()
-		if n == 1 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 }
 
 func (ptw *partitionWrapper) scheduleToDrop() {
@@ -176,12 +167,19 @@ func (tb *table) addPartitionNolock(pt *partition) {
 	tb.ptws = append(tb.ptws, ptw)
 }
 
+func (tb *table) waitForForceMergeCompletion() {
+	for tb.forceMergesRunning.Load() > 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // MustClose closes the table.
 // It is expected that all the pending searches on the table are finished before calling MustClose.
 func (tb *table) MustClose() {
 	tb.cancel()
 	tb.retentionWatcherWG.Wait()
 	tb.finalDedupWatcherWG.Wait()
+	tb.waitForForceMergeCompletion()
 
 	tb.ptwsLock.Lock()
 	ptws := tb.ptws
@@ -190,7 +188,6 @@ func (tb *table) MustClose() {
 
 	for _, ptw := range ptws {
 		// Wait for references to the partition to be released by searches and merges.
-		ptw.waitForSoleOwnership()
 		if n := ptw.refCount.Load(); n != 1 {
 			logger.Panicf("BUG: unexpected refCount=%d when closing the partition; probably there are pending searches or merges", n)
 		}
@@ -258,6 +255,8 @@ func (tb *table) UpdateMetrics(m *TableMetrics) {
 func (tb *table) ForceMergePartitions(partitionNamePrefix string) error {
 	ptws := tb.GetPartitions(nil)
 	defer tb.PutPartitions(ptws)
+	tb.forceMergesRunning.Add(1)
+	defer tb.forceMergesRunning.Add(-1)
 	for _, ptw := range ptws {
 		if !strings.HasPrefix(ptw.pt.name, partitionNamePrefix) {
 			continue
