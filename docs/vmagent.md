@@ -235,7 +235,6 @@ And to `http://<prod-url>` it will forward only metrics that have `env=prod` lab
 Please note, order of flags is important: 1st mentioned `-remoteWrite.urlRelabelConfig` will be applied to the
 1st mentioned `-remoteWrite.url`, and so on.
 
-
 ### Prometheus remote_write proxy
 
 `vmagent` can be used as a proxy for Prometheus data sent via Prometheus `remote_write` protocol. It can accept data via the `remote_write` API
@@ -250,6 +249,22 @@ writes are always performed in Prometheus remote_write protocol. Therefore, for 
 the `-remoteWrite.url` command-line flag should be configured as `<schema>://<vminsert-host>:8480/insert/<accountID>/prometheus/api/v1/write`
 according to [these docs](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#url-format).
 There is also support for multitenant writes. See [these docs](#multitenancy).
+
+### Flexible deduplication
+
+[Deduplication at stream aggregation](https://docs.victoriametrics.com/stream-aggregation/#deduplication) allows setting up arbitrary complex de-duplication schemes
+for the collected samples. Examples:
+
+- The following command instructs `vmagent` to send only the last sample per each seen [time series](https://docs.victoriametrics.com/keyconcepts/#time-series) per every 60 seconds:
+  ```
+  ./vmagent -remoteWrite.url=http://remote-storage/api/v1/write -remoteWrite.streamAggr.dedupInterval=60s
+  ```
+
+- The following command instructs `vmagent` to merge [time series](https://docs.victoriametrics.com/keyconcepts/#time-series) with different `replica` label values
+  and then to send only the last sample per each merged series per ever 60 seconds:
+  ```
+  ./vmagent -remoteWrite=http://remote-storage/api/v1/write -streamAggr.dropInputLabels=replica -remoteWrite.streamAggr.dedupInterval=60s
+  ```
 
 ## VictoriaMetrics remote write protocol
 
@@ -909,7 +924,6 @@ to all the metrics scraped by the given `vmagent` instance:
 
 See also [how to shard data among multiple remote storage systems](#sharding-among-remote-storages).
 
-
 ## High availability
 
 It is possible to run multiple **identically configured** `vmagent` instances or `vmagent` 
@@ -984,7 +998,7 @@ When this flag is specified, `vmagent` works in the following way if the configu
 
 - It returns `429 Too Many Requests` HTTP error to clients, which send data to `vmagent` via [supported HTTP endpoints](#how-to-push-data-to-vmagent).
   You can specify `-remoteWrite.dropSamplesOnOverload` command-line flag in order to drop the ingested samples instead of returning the error to clients in this case.
-- It suspends consuming data from [Kafka side](#reading-metrics-from-kafka) or [Google PubSub side](#pubsub-integration) until the remote storage becomes available.
+- It suspends consuming data from [Kafka side](#reading-metrics-from-kafka) or [Google PubSub side](#google-pubsub-integration) until the remote storage becomes available.
   You can specify `-remoteWrite.dropSamplesOnOverload` command-line flag in order to drop the fetched samples instead of suspending data consumption from Kafka or Google PubSub.
 - It drops samples pushed to `vmagent` via non-HTTP protocols and logs the error. Pass `-remoteWrite.dropSamplesOnOverload` on order to suppress error messages in this case.
 - It drops samples [scraped from Prometheus-compatible targets](#how-to-collect-metrics-in-prometheus-format), because it is better to drop samples
@@ -1666,12 +1680,12 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Incoming connections to -httpListenAddr are closed after the configured timeout. This may help evenly spreading load among a cluster of services behind TCP-level load balancer. Zero value disables closing of incoming connections (default 2m0s)
   -http.disableResponseCompression
      Disable compression of HTTP responses to save CPU resources. By default, compression is enabled to save network bandwidth
-  -http.header.csp default-src 'self'
-     Value for 'Content-Security-Policy' header, recommended: default-src 'self'
+  -http.header.csp string
+     Value for 'Content-Security-Policy' header, recommended: "default-src 'self'"
   -http.header.frameOptions string
      Value for 'X-Frame-Options' header
-  -http.header.hsts max-age=31536000; includeSubDomains
-     Value for 'Strict-Transport-Security' header, recommended: max-age=31536000; includeSubDomains
+  -http.header.hsts string
+     Value for 'Strict-Transport-Security' header, recommended: 'max-age=31536000; includeSubDomains'
   -http.idleConnTimeout duration
      Timeout for incoming idle http connections (default 1m0s)
   -http.maxGracefulShutdownDuration duration
@@ -1789,6 +1803,8 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Per-second limit on the number of WARN messages. If more than the given number of warns are emitted per second, then the remaining warns are suppressed. Zero values disable the rate limit
   -maxConcurrentInserts int
      The maximum number of concurrent insert requests. Default value should work for most cases, since it minimizes the memory usage. The default value can be increased when clients send data over slow networks. See also -insert.maxQueueDuration (default 32)
+  -maxIngestionRate int
+     The maximum number of samples vmagent can receive per second. If the limit is exceeded, the ingestion rate will be throttled (default 0)
   -maxInsertRequestSize size
      The maximum size in bytes of a single Prometheus remote_write API request
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 33554432)
@@ -2104,11 +2120,15 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Supports an array of values separated by comma or specified via multiple flags.
      Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.streamAggr.dedupInterval array
-     Input samples are de-duplicated with this interval before being aggregated. Only the last sample per each time series per each interval is aggregated if the interval is greater than zero (default 0s)
+     Input samples are de-duplicated with this interval before optional aggregation with -remoteWrite.streamAggr.config . See also -dedup.minScrapeInterval and https://docs.victoriametrics.com/stream-aggregation.html#deduplication (default 0s)
      Supports array of values separated by comma or specified via multiple flags.
      Empty values are set to default value.
   -remoteWrite.streamAggr.dropInput array
      Whether to drop all the input samples after the aggregation with -remoteWrite.streamAggr.config. By default, only aggregates samples are dropped, while the remaining samples are written to the corresponding -remoteWrite.url . See also -remoteWrite.streamAggr.keepInput and https://docs.victoriametrics.com/stream-aggregation.html
+     Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
+  -remoteWrite.streamAggr.ignoreOldSamples array
+     Whether to ignore input samples with old timestamps outside the current aggregation interval for the corresponding -remoteWrite.streamAggr.config . See https://docs.victoriametrics.com/stream-aggregation.html#ignoring-old-samples
      Supports array of values separated by comma or specified via multiple flags.
      Empty values are set to false.
   -remoteWrite.streamAggr.keepInput array
@@ -2153,6 +2173,10 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      The compression level for VictoriaMetrics remote write protocol. Higher values reduce network traffic at the cost of higher CPU usage. Negative values reduce CPU usage at the cost of increased network traffic. See https://docs.victoriametrics.com/vmagent.html#victoriametrics-remote-write-protocol
   -sortLabels
      Whether to sort labels for incoming samples before writing them to all the configured remote storage systems. This may be needed for reducing memory usage at remote storage when the order of labels in incoming samples is random. For example, if m{k1="v1",k2="v2"} may be sent as m{k2="v2",k1="v1"}Enabled sorting for labels can slow down ingestion performance a bit
+  -streamAggr.dropInputLabels array
+     An optional list of labels to drop from samples before stream de-duplication and aggregation . See https://docs.victoriametrics.com/stream-aggregation.html#dropping-unneeded-labels
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -tls array
      Whether to enable TLS for incoming HTTP requests at the given -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set. See also -mtls
      Supports array of values separated by comma or specified via multiple flags.

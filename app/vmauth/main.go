@@ -13,6 +13,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,8 @@ var (
 		"See https://docs.victoriametrics.com/vmauth.html#backend-tls-setup")
 	backendTLSCAFile = flag.String("backend.TLSCAFile", "", "Optional path to TLS root CA file, which is used for TLS verification when connecting to backends over HTTPS. "+
 		"See https://docs.victoriametrics.com/vmauth.html#backend-tls-setup")
+	extraAuthHeaders = flagutil.NewArrayString("extraAuthHeader", "extra to Authorization auth header names")
+	authHeaders      = []string{"Authorization"}
 )
 
 func main() {
@@ -69,6 +72,7 @@ func main() {
 	if len(listenAddrs) == 0 {
 		listenAddrs = []string{":8427"}
 	}
+	authHeaders = append(authHeaders, (*extraAuthHeaders)...)
 	logger.Infof("starting vmauth at %q...", listenAddrs)
 	startTime := time.Now()
 	initAuthConfig()
@@ -183,7 +187,7 @@ func processUserRequest(w http.ResponseWriter, r *http.Request, ui *UserInfo) {
 
 func processRequest(w http.ResponseWriter, r *http.Request, ui *UserInfo) {
 	u := normalizeURL(r.URL)
-	up, hc := ui.getURLPrefixAndHeaders(u)
+	up, hc := ui.getURLPrefixAndHeaders(u, r.Header)
 	isDefault := false
 	if up == nil {
 		if ui.DefaultURL == nil {
@@ -238,7 +242,14 @@ func tryProcessingRequest(w http.ResponseWriter, r *http.Request, targetURL *url
 	// This code has been copied from net/http/httputil/reverseproxy.go
 	req := sanitizeRequestHeaders(r)
 	req.URL = targetURL
-	req.Host = targetURL.Host
+
+	if req.URL.Scheme == "https" {
+		// Override req.Host only for https requests, since https server verifies hostnames during TLS handshake,
+		// so it expects the targetURL.Host in the request.
+		// There is no need in overriding the req.Host for http requests, since it is expected that backend server
+		// may properly process queries with the original req.Host.
+		req.Host = targetURL.Host
+	}
 	updateHeadersByConfig(req.Header, hc.RequestHeaders)
 	res, err := ui.httpTransport.RoundTrip(req)
 	rtb, rtbOK := req.Body.(*readTrackingBody)
@@ -271,7 +282,7 @@ func tryProcessingRequest(w http.ResponseWriter, r *http.Request, targetURL *url
 		logger.Warnf("remoteAddr: %s; requestURI: %s; retrying the request to %s because of response error: %s", remoteAddr, req.URL, targetURL, err)
 		return false
 	}
-	if hasInt(retryStatusCodes, res.StatusCode) {
+	if slices.Contains(retryStatusCodes, res.StatusCode) {
 		_ = res.Body.Close()
 		if !rtbOK || !rtb.canRetry() {
 			// If we get an error from the retry_status_codes list, but cannot execute retry,
@@ -311,15 +322,6 @@ func tryProcessingRequest(w http.ResponseWriter, r *http.Request, targetURL *url
 		return true
 	}
 	return true
-}
-
-func hasInt(a []int, n int) bool {
-	for _, x := range a {
-		if x == n {
-			return true
-		}
-	}
-	return false
 }
 
 var copyBufPool bytesutil.ByteBufferPool

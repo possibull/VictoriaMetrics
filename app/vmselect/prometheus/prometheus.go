@@ -54,11 +54,15 @@ var (
 	maxSeriesLimit      = flag.Int("search.maxSeries", 30e3, "The maximum number of time series, which can be returned from /api/v1/series. This option allows limiting memory usage")
 	maxLabelsAPISeries  = flag.Int("search.maxLabelsAPISeries", 1e6, "The maximum number of time series, which could be scanned when searching for the the matching time series "+
 		"at /api/v1/labels and /api/v1/label/.../values. This option allows limiting memory usage and CPU usage. See also -search.maxLabelsAPIDuration, "+
-		"-search.maxTagKeys and -search.maxTagValues")
+		"-search.maxTagKeys, -search.maxTagValues and -search.ignoreExtraFiltersAtLabelsAPI")
 	maxPointsPerTimeseries = flag.Int("search.maxPointsPerTimeseries", 30e3, "The maximum points per a single timeseries returned from /api/v1/query_range. "+
 		"This option doesn't limit the number of scanned raw samples in the database. The main purpose of this option is to limit the number of per-series points "+
 		"returned to graphing UI such as VMUI or Grafana. There is no sense in setting this limit to values bigger than the horizontal resolution of the graph. "+
 		"See also -search.maxResponseSeries")
+	ignoreExtraFiltersAtLabelsAPI = flag.Bool("search.ignoreExtraFiltersAtLabelsAPI", false, "Whether to ignore match[], extra_filters[] and extra_label query args at "+
+		"/api/v1/labels and /api/v1/label/.../values . This may be useful for decreasing load on VictoriaMetrics when extra filters "+
+		"match too many time series. The downside is that suprflouos labels or series could be returned, which do not match the extra filters. "+
+		"See also -search.maxLabelsAPISeries and -search.maxLabelsAPIDuration")
 )
 
 // Default step used if not set.
@@ -1127,14 +1131,14 @@ func getExportParams(r *http.Request, startTime time.Time) (*commonParams, error
 }
 
 func getCommonParamsForLabelsAPI(r *http.Request, startTime time.Time, requireNonEmptyMatch bool) (*commonParams, error) {
-	cp, err := getCommonParams(r, startTime, requireNonEmptyMatch)
+	cp, err := getCommonParamsInternal(r, startTime, requireNonEmptyMatch, true)
 	if err != nil {
 		return nil, err
 	}
 	if cp.start == 0 {
 		cp.start = cp.end - defaultStep
 	}
-	cp.deadline = searchutils.GetDeadlineForExport(r, startTime)
+	cp.deadline = searchutils.GetDeadlineForLabelsAPI(r, startTime)
 	return cp, nil
 }
 
@@ -1147,6 +1151,10 @@ func getCommonParamsForLabelsAPI(r *http.Request, startTime time.Time, requireNo
 // - extra_label
 // - extra_filters[]
 func getCommonParams(r *http.Request, startTime time.Time, requireNonEmptyMatch bool) (*commonParams, error) {
+	return getCommonParamsInternal(r, startTime, requireNonEmptyMatch, false)
+}
+
+func getCommonParamsInternal(r *http.Request, startTime time.Time, requireNonEmptyMatch, isLabelsAPI bool) (*commonParams, error) {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
 	start, err := httputils.GetTime(r, "start", 0)
 	if err != nil {
@@ -1173,15 +1181,23 @@ func getCommonParams(r *http.Request, startTime time.Time, requireNonEmptyMatch 
 	if requireNonEmptyMatch && len(matches) == 0 {
 		return nil, fmt.Errorf("missing `match[]` arg")
 	}
-	tagFilterss, err := getTagFilterssFromMatches(matches)
+	filterss, err := getTagFilterssFromMatches(matches)
 	if err != nil {
 		return nil, err
 	}
-	etfs, err := searchutils.GetExtraTagFilters(r)
-	if err != nil {
-		return nil, err
+
+	if len(filterss) > 0 || !isLabelsAPI || !*ignoreExtraFiltersAtLabelsAPI {
+		// If matches isn't empty, then there is no sense in ignoring extra filters
+		// even if ignoreExtraLabelsAtLabelsAPI is set, since extra filters won't slow down
+		// the query - they can only improve query performance by reducing the number
+		// of matching series at the storage level.
+		etfs, err := searchutils.GetExtraTagFilters(r)
+		if err != nil {
+			return nil, err
+		}
+		filterss = searchutils.JoinTagFilterss(filterss, etfs)
 	}
-	filterss := searchutils.JoinTagFilterss(tagFilterss, etfs)
+
 	cp := &commonParams{
 		deadline:         deadline,
 		start:            start,

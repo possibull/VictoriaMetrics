@@ -3,11 +3,14 @@ package opentelemetry
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentelemetry/firehose"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentelemetry/stream"
 	"github.com/VictoriaMetrics/metrics"
 )
@@ -17,17 +20,35 @@ var (
 	rowsPerInsert = metrics.NewHistogram(`vm_rows_per_insert{type="opentelemetry"}`)
 )
 
+// WriteResponseFn function to write HTTP response data
+type WriteResponseFn func(http.ResponseWriter, time.Time, error)
+
 // InsertHandler processes opentelemetry metrics.
-func InsertHandler(req *http.Request) error {
+func InsertHandler(req *http.Request) (WriteResponseFn, error) {
+	isGzipped := req.Header.Get("Content-Encoding") == "gzip"
+	var processBody func([]byte) ([]byte, error)
+	writeResponse := func(w http.ResponseWriter, _ time.Time, err error) {
+		if err == nil {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			httpserver.Errorf(w, req, "%s", err)
+		}
+	}
+	if req.Header.Get("Content-Type") == "application/json" {
+		if fhRequestID := req.Header.Get("X-Amz-Firehose-Request-Id"); fhRequestID != "" {
+			processBody = firehose.ProcessRequestBody
+			writeResponse = func(w http.ResponseWriter, t time.Time, err error) {
+				firehose.ResponseWriter(w, t, fhRequestID, err)
+			}
+		} else {
+			return writeResponse, fmt.Errorf("json encoding isn't supported for opentelemetry format. Use protobuf encoding")
+		}
+	}
 	extraLabels, err := parserCommon.GetExtraLabels(req)
 	if err != nil {
-		return err
+		return writeResponse, err
 	}
-	isGzipped := req.Header.Get("Content-Encoding") == "gzip"
-	if req.Header.Get("Content-Type") == "application/json" {
-		return fmt.Errorf("json encoding isn't supported for opentelemetry format. Use protobuf encoding")
-	}
-	return stream.ParseStream(req.Body, isGzipped, func(tss []prompbmarshal.TimeSeries) error {
+	return writeResponse, stream.ParseStream(req.Body, isGzipped, processBody, func(tss []prompbmarshal.TimeSeries) error {
 		return insertRows(tss, extraLabels)
 	})
 }
